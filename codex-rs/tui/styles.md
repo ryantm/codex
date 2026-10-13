@@ -42,3 +42,19 @@
 - When a description needs multiple sentences, keep normal punctuation, including the final period.
   Do not combine sentences at the expense of clarity.
 - Preserve externally supplied descriptions as written.
+
+# Terminal palette changes
+
+On Unix, terminals that answer the startup OSC 10/11 probe are sampled every two
+seconds while Codex owns the terminal. Changes to the default foreground or
+background update the shared palette and request a redraw, so palette-derived
+styles such as the composer background follow live terminal theme changes,
+including through SSH and multiplexers that forward color queries.
+
+Runtime queries use crossterm's shared parser to retain interleaved keys and
+bracketed paste. Queries pause during editor and suspend handoffs, and terminal
+restoration waits for an in-flight query. Rendering continues while querying;
+input can be delayed by the query round trips. A failed query retains the last
+complete palette and stops further sampling for that TUI (crossterm's timeout is
+two seconds per color). Terminals without a startup palette keep their existing
+fallback behavior. The separately selected `/theme` syntax theme is unchanged.

@@ -38,18 +38,99 @@ fn focus_gained_with_unanswered_palette_queries_preserves_immediate_input() -> R
     let mut terminal = PtyCodex::start(&repo_root, codex_home, &["--no-alt-screen"])?;
     terminal.wait_for_startup()?;
 
+    // The startup probe succeeded, but this terminal stops answering runtime queries.
+    // Input arriving during that timeout must still reach the composer.
     let startup_output_len = terminal.output.len();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !contains_bytes(&terminal.output[startup_output_len..], b"\x1b]10;?") {
+        ensure!(Instant::now() < deadline, "missing runtime palette query");
+        terminal.read_output(Duration::from_millis(20))?;
+        terminal.ensure_running()?;
+    }
     let focus_started = Instant::now();
     terminal.write_input(format!("\u{1b}[I{FOCUS_PROBE_INPUT}").as_bytes())?;
-    terminal.wait_for_focus_input(FOCUS_PROBE_INPUT, focus_started, startup_output_len)?;
+    terminal.wait_for_focus_input(FOCUS_PROBE_INPUT, focus_started)?;
 
     let delayed_input = format!("{FOCUS_PROBE_INPUT}-delayed");
     let delayed_focus_started = Instant::now();
     terminal.write_input(b"\x1b[I")?;
     terminal.read_output(Duration::from_millis(/*millis*/ 20))?;
     terminal.write_input(delayed_input.as_bytes())?;
-    terminal.wait_for_focus_input(&delayed_input, delayed_focus_started, startup_output_len)?;
+    terminal.wait_for_focus_input(&delayed_input, delayed_focus_started)?;
 
+    Ok(())
+}
+
+#[test]
+fn live_palette_refresh_repaints_composer_and_preserves_keys_and_paste() -> Result<()> {
+    let repo_root = codex_utils_cargo_bin::repo_root()?;
+    let codex_home = tempfile::tempdir()?;
+    write_test_config(codex_home.path(), &repo_root)?;
+    let mut terminal = PtyCodex::start(&repo_root, codex_home, &["--no-alt-screen"])?;
+    terminal.wait_for_startup()?;
+    let mut answered_until = terminal.output.len();
+
+    for (light, expected_text) in [(true, "typed-pasted"), (false, "typed-pastedtyped-pasted")] {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut foreground_answered = false;
+        let mut background_answered = false;
+        loop {
+            terminal.read_output(Duration::from_millis(20))?;
+            if !foreground_answered
+                && contains_bytes(&terminal.output[answered_until..], b"\x1b]10;?")
+            {
+                // User input and OSC replies share the same PTY and parser. Deliver both
+                // ordinary keys and bracketed paste while a color query owns that parser.
+                terminal.write_input(b"typed-\x1b[200~pasted\x1b[201~")?;
+                terminal.write_input(if light {
+                    b"\x1b]10;rgb:0000/0000/0000\x1b\\"
+                } else {
+                    b"\x1b]10;rgb:ffff/ffff/ffff\x1b\\"
+                })?;
+                foreground_answered = true;
+                answered_until = terminal.output.len();
+            }
+            if foreground_answered
+                && !background_answered
+                && contains_bytes(&terminal.output[answered_until..], b"\x1b]11;?")
+            {
+                terminal.write_input(if light {
+                    b"\x1b]11;rgb:ffff/ffff/ffff\x1b\\"
+                } else {
+                    b"\x1b]11;rgb:0000/0000/0000\x1b\\"
+                })?;
+                background_answered = true;
+                answered_until = terminal.output.len();
+            }
+            let screen = terminal.parser.screen();
+            let composer_row = screen
+                .contents()
+                .lines()
+                .position(|line| line.contains(expected_text));
+            if background_answered && let Some(row) = composer_row {
+                let background = screen
+                    .cell(u16::try_from(row)?, 2)
+                    .context("composer cell")?
+                    .bgcolor();
+                // A 4% black overlay on white versus a 12% white overlay on black.
+                if background
+                    == if light {
+                        vt100::Color::Rgb(244, 244, 244)
+                    } else {
+                        vt100::Color::Rgb(30, 30, 30)
+                    }
+                {
+                    break;
+                }
+            }
+            ensure!(
+                Instant::now() < deadline,
+                "palette did not update or input was lost; screen:\n{}",
+                terminal.screen_contents()
+            );
+            terminal.ensure_running()?;
+        }
+    }
     Ok(())
 }
 
@@ -360,6 +441,7 @@ impl PtyCodex {
             .arg("-C")
             .arg(repo_root)
             .env("TERM", "xterm-256color")
+            .env("COLORTERM", "truecolor")
             // This PTY answers its own capability probes; it is not inside the caller's mux.
             .env_remove("TMUX")
             .env_remove("TMUX_PANE")
@@ -413,20 +495,9 @@ impl PtyCodex {
         );
     }
 
-    fn wait_for_focus_input(
-        &mut self,
-        input: &str,
-        focus_started: Instant,
-        startup_output_len: usize,
-    ) -> Result<()> {
+    fn wait_for_focus_input(&mut self, input: &str, focus_started: Instant) -> Result<()> {
         while focus_started.elapsed() < FOCUS_INPUT_TIMEOUT {
             self.read_output(Duration::from_millis(/*millis*/ 20))?;
-            let focus_output = &self.output[startup_output_len..];
-            ensure!(
-                !contains_bytes(focus_output, b"\x1b]10;?")
-                    && !contains_bytes(focus_output, b"\x1b]11;?"),
-                "focus regain queried terminal colors after the startup palette was cached",
-            );
             if self.screen_contains(input) {
                 return Ok(());
             }

@@ -112,6 +112,7 @@ impl<S: EventSource + Default> EventBroker<S> {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         *state = EventBrokerState::Start;
+        drop(state);
         let _ = self.resume_events_tx.send(());
     }
 
@@ -121,6 +122,29 @@ impl<S: EventSource + Default> EventBroker<S> {
     /// underlying crossterm stream to be recreated.
     pub fn resume_events_rx(&self) -> watch::Receiver<()> {
         self.resume_events_tx.subscribe()
+    }
+
+    /// Query through crossterm's own parser while its blocking event stream is stopped.
+    /// Unlike a raw /dev/tty probe, its color filters retain interleaved keys and pastes.
+    /// The broker lock also keeps editor/suspend handoffs from racing this query.
+    #[cfg(unix)]
+    pub(super) fn refresh_colors(
+        &self,
+        query: &mut impl FnMut() -> std::io::Result<crate::terminal_palette::DefaultColors>,
+    ) -> std::io::Result<bool> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if matches!(*state, EventBrokerState::Paused) {
+            return Ok(false);
+        }
+        *state = EventBrokerState::Paused;
+        let result = query().map(crate::terminal_palette::update_default_colors);
+        *state = EventBrokerState::Start;
+        drop(state);
+        let _ = self.resume_events_tx.send(());
+        result
     }
 }
 
@@ -215,11 +239,19 @@ impl<S: EventSource + Default + Unpin> TuiEventStream<S> {
         // until we return a mapped event, hit Pending, or see EOF/error.
         loop {
             let poll_result = {
-                let mut state = self
-                    .broker
-                    .state
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                // A background color query owns the input briefly. Keep rendering instead
+                // of blocking the UI thread; completion always wakes resume_stream.
+                let mut state = match self.broker.state.try_lock() {
+                    Ok(state) => state,
+                    Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+                    Err(std::sync::TryLockError::WouldBlock) => {
+                        match Pin::new(&mut self.resume_stream).poll_next(cx) {
+                            Poll::Ready(Some(())) => continue,
+                            Poll::Ready(None) => return Poll::Ready(None),
+                            Poll::Pending => return Poll::Pending,
+                        }
+                    }
+                };
                 let events = match state.active_event_source_mut() {
                     Some(events) => events,
                     None => {
@@ -304,8 +336,8 @@ impl<S: EventSource + Default + Unpin> TuiEventStream<S> {
             Event::Paste(pasted) => Some(TuiEvent::Paste(pasted)),
             Event::FocusGained => {
                 self.terminal_focused.store(true, Ordering::Relaxed);
-                // Keep the startup-cached palette: querying terminal colors here blocks the
-                // input loop, and a direct probe would discard keys typed during the refresh.
+                // The background palette monitor refreshes colors through the shared parser.
+                // Never read /dev/tty directly here: it could discard interleaved input.
                 Some(TuiEvent::FocusGained)
             }
             Event::FocusLost => {
@@ -445,6 +477,100 @@ mod tests {
         let (draw_tx, draw_rx) = broadcast::channel(1);
         let terminal_focused = Arc::new(AtomicBool::new(true));
         (broker, handle, draw_tx, draw_rx, terminal_focused)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn palette_refresh_tracks_light_and_dark_and_retains_last_good_sample() {
+        use crate::terminal_palette::DefaultColors;
+
+        let broker = EventBroker::<FakeEventSource>::new();
+        let dark = DefaultColors {
+            fg: (240, 240, 240),
+            bg: (20, 20, 20),
+        };
+        let light = DefaultColors {
+            fg: (20, 20, 20),
+            bg: (240, 240, 240),
+        };
+        crate::terminal_palette::with_test_default_colors(
+            crate::terminal_probe::DefaultColors {
+                fg: dark.fg,
+                bg: dark.bg,
+            },
+            || {
+                let dark_style = crate::style::user_message_style();
+                assert!(!broker.refresh_colors(&mut || Ok(dark)).unwrap());
+                assert!(broker.refresh_colors(&mut || Ok(light)).unwrap());
+                assert_eq!(crate::terminal_palette::default_fg(), Some(light.fg));
+                assert_eq!(crate::terminal_palette::default_bg(), Some(light.bg));
+                assert_ne!(crate::style::user_message_style(), dark_style);
+                assert!(
+                    broker
+                        .refresh_colors(&mut || Err(std::io::ErrorKind::TimedOut.into()))
+                        .is_err()
+                );
+                assert_eq!(crate::terminal_palette::default_bg(), Some(light.bg));
+                assert!(matches!(
+                    *broker.state.lock().unwrap(),
+                    EventBrokerState::Start
+                ));
+                assert!(broker.refresh_colors(&mut || Ok(dark)).unwrap());
+                assert_eq!(crate::style::user_message_style(), dark_style);
+            },
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn palette_refresh_does_not_query_during_terminal_handoff() {
+        let broker = EventBroker::<FakeEventSource>::new();
+        broker.pause_events();
+        assert!(
+            !broker
+                .refresh_colors(&mut || panic!("queried a paused terminal"))
+                .unwrap()
+        );
+        assert!(matches!(
+            *broker.state.lock().unwrap(),
+            EventBrokerState::Paused
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn pending_palette_query_allows_draws_and_wakes_input_after_failure() {
+        let (broker, handle, draw_tx, draw_rx, terminal_focused) = setup();
+        let mut stream = make_stream(broker.clone(), draw_rx, terminal_focused);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (finish_tx, finish_rx) = std::sync::mpsc::channel();
+        let query_broker = broker.clone();
+        let worker = std::thread::spawn(move || {
+            let mut started_tx = Some(started_tx);
+            query_broker.refresh_colors(&mut || {
+                started_tx.take().unwrap().send(()).unwrap();
+                finish_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                Err(std::io::ErrorKind::TimedOut.into())
+            })
+        });
+        started_rx.await.unwrap();
+        draw_tx.send(()).unwrap();
+        assert!(matches!(
+            timeout(Duration::from_secs(1), stream.next())
+                .await
+                .unwrap(),
+            Some(TuiEvent::Draw)
+        ));
+        let task = tokio::spawn(async move { stream.next().await });
+        tokio::task::yield_now().await;
+        finish_tx.send(()).unwrap();
+        assert!(worker.join().unwrap().is_err());
+        let expected = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE);
+        handle.send(Ok(Event::Key(expected)));
+        assert!(matches!(
+            timeout(Duration::from_secs(1), task).await.unwrap().unwrap(),
+            Some(TuiEvent::Key(key)) if key == expected
+        ));
     }
 
     #[tokio::test(flavor = "current_thread")]

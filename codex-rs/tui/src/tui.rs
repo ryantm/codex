@@ -75,6 +75,8 @@ mod notification_preview;
 #[cfg(test)]
 #[path = "tui/owned_screen_tests.rs"]
 mod owned_screen_tests;
+#[cfg(unix)]
+mod palette_monitor;
 #[cfg(all(test, unix))]
 #[path = "tui_panic_tests.rs"]
 mod panic_tests;
@@ -123,6 +125,9 @@ fn should_emit_notification(condition: NotificationCondition, terminal_focused: 
 
 impl Drop for Tui {
     fn drop(&mut self) {
+        // Stop terminal queries before the terminal is handed back to the shell.
+        #[cfg(unix)]
+        self.palette_monitor.take();
         if let Err(err) = self.clear_ambient_pet_image() {
             tracing::debug!(error = %err, "failed to clear ambient pet image on TUI drop");
         }
@@ -400,6 +405,8 @@ pub(super) fn reapply_raw_mode_after_resume() -> Result<()> {
 /// Uses a stronger keyboard reset than `restore` so the parent shell recovers even if a
 /// terminal missed the stack pop that normally pairs with [`set_modes`].
 pub fn restore_after_exit() -> Result<()> {
+    #[cfg(unix)]
+    palette_monitor::pause_before_restore();
     let mut first_error = restore_common(
         RawModeRestore::Disable,
         KeyboardRestore::ResetAfterExit,
@@ -662,6 +669,8 @@ pub struct Tui {
     frame_requester: FrameRequester,
     draw_tx: broadcast::Sender<()>,
     event_broker: Arc<EventBroker>,
+    #[cfg(unix)]
+    palette_monitor: Option<palette_monitor::PaletteMonitor>,
     pub(crate) terminal: Terminal,
     pending_history_lines: Vec<PendingHistoryLines>,
     clear_thread_switch_on_draw: bool,
@@ -733,12 +742,18 @@ impl Tui {
             terminal.last_known_screen_size,
             draw_tx.clone(),
         );
+        let event_broker = Arc::new(event_broker);
+        #[cfg(unix)]
+        let palette_monitor =
+            palette_monitor::PaletteMonitor::start(&event_broker, draw_tx.clone());
 
         Self {
             link_hover: link_pointer::LinkHover::default(),
             frame_requester,
             draw_tx,
-            event_broker: Arc::new(event_broker),
+            event_broker,
+            #[cfg(unix)]
+            palette_monitor,
             terminal,
             pending_history_lines: vec![],
             clear_thread_switch_on_draw: false,
@@ -890,6 +905,7 @@ impl Tui {
     /// Reclaim terminal modes and stderr after a panic hook ran inside a recovery boundary.
     pub(crate) fn recover_after_caught_panic(&mut self) -> Result<()> {
         set_modes()?;
+        self.resume_events();
         self._stderr_guard.recover_after_caught_panic()?;
         self.terminal.invalidate_cursor_state();
         if self.is_owned_screen() || self.overlay_input != OverlayInput::Default {

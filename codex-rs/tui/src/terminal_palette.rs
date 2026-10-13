@@ -88,10 +88,10 @@ fn best_color_for_color_level(target: (u8, u8, u8), color_level: StdoutColorLeve
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DefaultColors {
-    fg: (u8, u8, u8),
-    bg: (u8, u8, u8),
+    pub(crate) fg: (u8, u8, u8),
+    pub(crate) bg: (u8, u8, u8),
 }
 
 #[cfg(test)]
@@ -133,6 +133,18 @@ pub fn default_fg() -> Option<(u8, u8, u8)> {
 
 pub fn default_bg() -> Option<(u8, u8, u8)> {
     default_colors().map(|c| c.bg)
+}
+
+/// Publish a complete live sample, retaining the last good palette on query failure.
+#[cfg(unix)]
+pub(crate) fn update_default_colors(colors: DefaultColors) -> bool {
+    #[cfg(test)]
+    return TEST_DEFAULT_COLORS.with(|current| current.replace(Some(colors)) != Some(colors));
+
+    #[cfg(not(test))]
+    {
+        imp::update_default_colors(colors)
+    }
 }
 
 #[cfg(any(unix, windows))]
@@ -181,6 +193,17 @@ mod imp {
         let cache = default_colors_cache();
         let mut cache = cache.lock().ok()?;
         cache.get_or_init_with(query_default_colors)
+    }
+
+    #[cfg(unix)]
+    pub(super) fn update_default_colors(colors: DefaultColors) -> bool {
+        let mut cache = default_colors_cache()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let changed = cache.value != Some(colors);
+        cache.value = Some(colors);
+        cache.attempted = true;
+        changed
     }
 
     pub(super) fn set_default_colors_from_startup_probe(
